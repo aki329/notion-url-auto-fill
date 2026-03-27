@@ -10,10 +10,10 @@ type PageCandidate = {
   id: string;
   url: string;
   currentStatus?: string;
-  existingName?: string;
-  existingSummary?: string;
-  existingMetaDescription?: string;
+  existingTitle?: string;
   existingCanonicalUrl?: string;
+  errorNotePropertyName: "Error Note" | "メモ";
+  statusType?: "status" | "select";
 };
 
 type ExtractedArticle = {
@@ -46,7 +46,17 @@ type ProcessError = {
   step: string;
 };
 
-const MAIN_REQUIRED_FIELDS = ["Name", "Summary", "Meta Description", "Canonical URL"] as const;
+const NOTION_PROPS = {
+  title: "記事タイトル",
+  url: "URL",
+  summary: "導入要約",
+  publishedDate: "公開日",
+  status: "ステータス",
+  lastProcessedAt: "Last Processed At",
+  memo: "メモ",
+  legacyErrorNote: "Error Note",
+  canonicalUrl: "Canonical URL",
+} as const;
 
 function loadConfig(): AppConfig {
   const notionToken = process.env.NOTION_TOKEN;
@@ -378,8 +388,8 @@ function processErrorToNote(err: ProcessError): string {
   return `type=${err.type}; step=${err.step}; message=${err.message}; url=${err.url}`;
 }
 
-function getTitleFromPage(page: Record<string, any>): string | undefined {
-  const prop = page.properties?.Name;
+function getTitleFromPage(page: Record<string, any>, propertyName: string): string | undefined {
+  const prop = page.properties?.[propertyName];
   if (prop?.type !== "title") return undefined;
   return prop.title?.map((t: any) => t.plain_text).join("")?.trim();
 }
@@ -396,8 +406,8 @@ function getUrlProp(page: Record<string, any>, propertyName: string): string | u
   return textOrEmpty(prop.url ?? "") || undefined;
 }
 
-function getStatus(page: Record<string, any>): string | undefined {
-  const prop = page.properties?.Status;
+function getStatus(page: Record<string, any>, propertyName: string): string | undefined {
+  const prop = page.properties?.[propertyName];
   if (!prop) return undefined;
 
   if (prop.type === "status") return prop.status?.name;
@@ -407,14 +417,7 @@ function getStatus(page: Record<string, any>): string | undefined {
 
 function shouldSkipCandidate(page: PageCandidate): boolean {
   if (!page.url || !isValidHttpUrl(page.url)) return true;
-
-  const status = (page.currentStatus ?? "").toLowerCase();
-  const isDone = status === "done";
-
-  const hasMainFields = Boolean(page.existingName && page.existingSummary && page.existingMetaDescription);
-  if (isDone && hasMainFields) return true;
-
-  return false;
+  return page.currentStatus === "完了";
 }
 
 async function queryDatabasePages(notion: Client, config: AppConfig): Promise<PageCandidate[]> {
@@ -423,7 +426,7 @@ async function queryDatabasePages(notion: Client, config: AppConfig): Promise<Pa
     page_size: config.maxPagesPerRun,
     sorts: [
       {
-        property: "Last Processed At",
+        property: NOTION_PROPS.lastProcessedAt,
         direction: "ascending",
       },
     ],
@@ -433,21 +436,17 @@ async function queryDatabasePages(notion: Client, config: AppConfig): Promise<Pa
     .filter((r): r is Record<string, any> => r.object === "page")
     .map((page) => ({
       id: page.id,
-      url: getUrlProp(page, "URL") ?? "",
-      currentStatus: getStatus(page),
-      existingName: getTitleFromPage(page),
-      existingSummary: getRichText(page, "Summary"),
-      existingMetaDescription: getRichText(page, "Meta Description"),
-      existingCanonicalUrl: getUrlProp(page, "Canonical URL"),
+      url: getUrlProp(page, NOTION_PROPS.url) ?? "",
+      currentStatus: getStatus(page, NOTION_PROPS.status),
+      existingTitle: getTitleFromPage(page, NOTION_PROPS.title),
+      existingCanonicalUrl: getUrlProp(page, NOTION_PROPS.canonicalUrl),
+      errorNotePropertyName: page.properties?.[NOTION_PROPS.legacyErrorNote]
+        ? NOTION_PROPS.legacyErrorNote
+        : NOTION_PROPS.memo,
+      statusType: page.properties?.[NOTION_PROPS.status]?.type,
     }));
 
-  return pages.filter((page) => {
-    if (shouldSkipCandidate(page)) return false;
-
-    const status = (page.currentStatus ?? "").toLowerCase();
-    const missingMainField = !page.existingName || !page.existingSummary || !page.existingMetaDescription;
-    return ["", "pending", "retry", "error"].includes(status) || missingMainField;
-  });
+  return pages.filter((page) => !shouldSkipCandidate(page));
 }
 
 async function buildCanonicalSet(notion: Client, config: AppConfig): Promise<Set<string>> {
@@ -460,92 +459,75 @@ async function buildCanonicalSet(notion: Client, config: AppConfig): Promise<Set
   for (const result of response.results) {
     if (result.object !== "page") continue;
     const page = result as Record<string, any>;
-    const canonicalUrl = getUrlProp(page, "Canonical URL");
-    const url = getUrlProp(page, "URL");
-    const status = (getStatus(page) ?? "").toLowerCase();
+    const canonicalUrl = getUrlProp(page, NOTION_PROPS.canonicalUrl);
+    const url = getUrlProp(page, NOTION_PROPS.url);
+    const status = getStatus(page, NOTION_PROPS.status);
 
-    // doneデータのみ重複判定に使う
-    if (status !== "done") continue;
+    // 完了データのみ重複判定に使う
+    if (status !== "完了") continue;
     if (canonicalUrl) set.add(canonicalUrl);
     if (url) set.add(url);
   }
   return set;
 }
 
-async function markPageError(notion: Client, pageId: string, error: ProcessError): Promise<void> {
+function buildStatusUpdate(type: "status" | "select" | undefined, name: string): Record<string, unknown> {
+  if (type === "select") {
+    return { select: { name } };
+  }
+  return { status: { name } };
+}
+
+async function markPageError(
+  notion: Client,
+  pageId: string,
+  error: ProcessError,
+  page: Pick<PageCandidate, "errorNotePropertyName" | "statusType">,
+): Promise<void> {
   await notion.pages.update({
     page_id: pageId,
     properties: {
-      Status: {
-        status: { name: "error" },
-      },
-      "Error Note": {
+      [NOTION_PROPS.status]: buildStatusUpdate(page.statusType, "エラー"),
+      [page.errorNotePropertyName]: {
         rich_text: [{ type: "text", text: { content: processErrorToNote(error).slice(0, 1900) } }],
       },
-      "Last Processed At": {
+      [NOTION_PROPS.lastProcessedAt]: {
         date: { start: new Date().toISOString() },
-      },
-      "Retry Count": {
-        number: 1,
       },
     },
   });
 }
 
-async function updatePageSuccess(notion: Client, pageId: string, data: ExtractedArticle): Promise<void> {
-  await notion.pages.update({
-    page_id: pageId,
-    properties: {
-      Name: {
-        title: [{ type: "text", text: { content: data.title.slice(0, 200) } }],
-      },
-      Summary: {
-        rich_text: [{ type: "text", text: { content: data.summaryJa.slice(0, 1900) } }],
-      },
-      "Meta Description": {
-        rich_text: [{ type: "text", text: { content: (data.metaDescription ?? "").slice(0, 1900) } }],
-      },
-      "OGP Image": {
-        url: data.ogpImage ?? null,
-      },
-      "Site Name": {
-        rich_text: [{ type: "text", text: { content: (data.siteName ?? "").slice(0, 200) } }],
-      },
-      Author: {
-        rich_text: [{ type: "text", text: { content: (data.author ?? "").slice(0, 200) } }],
-      },
-      "Published Date": data.publishedDate
-        ? {
-            date: { start: data.publishedDate },
-          }
-        : {
-            date: null,
-          },
-      Category: {
-        select: { name: data.category },
-      },
-      Tags: {
-        multi_select: data.tags.map((tag) => ({ name: tag.slice(0, 100) })),
-      },
-      "Source Type": {
-        select: { name: data.sourceType },
-      },
-      "Canonical URL": {
-        url: data.canonicalUrl,
-      },
-      Domain: {
-        rich_text: [{ type: "text", text: { content: data.domain } }],
-      },
-      Status: {
-        status: { name: "done" },
-      },
-      "Error Note": {
-        rich_text: [],
-      },
-      "Last Processed At": {
-        date: { start: new Date().toISOString() },
-      },
+async function updatePageSuccess(notion: Client, page: PageCandidate, data: ExtractedArticle): Promise<void> {
+  const properties: Record<string, unknown> = {
+    [NOTION_PROPS.summary]: {
+      rich_text: [{ type: "text", text: { content: data.summaryJa.slice(0, 1900) } }],
     },
+    [NOTION_PROPS.publishedDate]: data.publishedDate
+      ? {
+          date: { start: data.publishedDate },
+        }
+      : {
+          date: null,
+        },
+    [NOTION_PROPS.status]: buildStatusUpdate(page.statusType, "完了"),
+    [page.errorNotePropertyName]: {
+      rich_text: [],
+    },
+    [NOTION_PROPS.lastProcessedAt]: {
+      date: { start: new Date().toISOString() },
+    },
+  };
+
+  if (!page.existingTitle) {
+    properties[NOTION_PROPS.title] = {
+      title: [{ type: "text", text: { content: data.title.slice(0, 200) } }],
+    };
+  }
+
+  await notion.pages.update({
+    page_id: page.id,
+    properties,
   });
 }
 
@@ -557,6 +539,9 @@ async function run(): Promise<void> {
 
   const pages = await queryDatabasePages(notion, config);
   console.log(`[INFO] 処理候補: ${pages.length}件`);
+  console.log(
+    `[INFO] 使用プロパティ: title=${NOTION_PROPS.title}, url=${NOTION_PROPS.url}, summary=${NOTION_PROPS.summary}, publishedDate=${NOTION_PROPS.publishedDate}, status=${NOTION_PROPS.status}, lastProcessedAt=${NOTION_PROPS.lastProcessedAt}, memoFallback=${NOTION_PROPS.memo}`,
+  );
 
   const doneUrlSet = await buildCanonicalSet(notion, config);
 
@@ -572,7 +557,8 @@ async function run(): Promise<void> {
         step: "validate_url",
       };
       console.log(`[WARN] ${processErrorToNote(err)}`);
-      await markPageError(notion, page.id, err);
+      await markPageError(notion, page.id, err, page);
+      console.log(`[RESULT] pageId=${page.id} status=エラー memoProp=${page.errorNotePropertyName}`);
       continue;
     }
 
@@ -591,16 +577,19 @@ async function run(): Promise<void> {
         continue;
       }
 
-      await updatePageSuccess(notion, page.id, extracted);
+      await updatePageSuccess(notion, page, extracted);
       doneUrlSet.add(url);
       doneUrlSet.add(extracted.canonicalUrl);
-      console.log(`[DONE] ${extracted.title}`);
+      console.log(
+        `[RESULT] pageId=${page.id} status=完了 titleUpdated=${!page.existingTitle} summaryProp=${NOTION_PROPS.summary} publishedDateProp=${NOTION_PROPS.publishedDate} memoCleared=${page.errorNotePropertyName}`,
+      );
     } catch (error) {
       const processError = toProcessError(error, url, "fetch_or_extract_or_update");
       console.log(`[ERROR] ${processErrorToNote(processError)}`);
 
       try {
-        await markPageError(notion, page.id, processError);
+        await markPageError(notion, page.id, processError, page);
+        console.log(`[RESULT] pageId=${page.id} status=エラー memoProp=${page.errorNotePropertyName}`);
       } catch (notionUpdateError) {
         console.error("[FATAL] Notionへのエラー書き戻しにも失敗", notionUpdateError);
       }
